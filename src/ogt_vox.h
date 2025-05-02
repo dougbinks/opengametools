@@ -244,7 +244,7 @@
         float m20, m21, m22, m23;   // column 2 of 4x4 matrix, 1st three elements = z axis vector, last element always 0.0
         float m30, m31, m32, m33;   // column 3 of 4x4 matrix. 1st three elements = translation vector, last element always 1.0
     } ogt_vox_transform;
-    
+
     ogt_vox_transform ogt_vox_transform_get_identity();
     ogt_vox_transform ogt_vox_transform_multiply(const ogt_vox_transform & a, const ogt_vox_transform & b);
 
@@ -324,7 +324,7 @@
         ogt_cam_mode mode;
         float        focus[3];    // the target position
         float        angle[3];    // rotation in degree
-        int          radius;
+        float        radius;
         float        frustum;
         int          fov;         // angle in degree
     } ogt_vox_cam;
@@ -458,7 +458,7 @@
     // sample the model index for a given instance at the given frame
     uint32_t          ogt_vox_sample_instance_model(const ogt_vox_instance* instance, uint32_t frame_index);
 
-    // samples the transform for an instance at a given frame. 
+    // samples the transform for an instance at a given frame.
     //   ogt_vox_sample_instance_transform_global returns the transform in world space (aka global)
     //   ogt_vox_sample_instance_transform_local returns the transform relative to its parent group
     ogt_vox_transform ogt_vox_sample_instance_transform_global(const ogt_vox_instance* instance, uint32_t frame_index, const ogt_vox_scene* scene);
@@ -507,7 +507,7 @@
     static const uint32_t CHUNK_ID_rCAM = MAKE_VOX_CHUNK_ID('r','C','A','M');
 
     static const uint32_t NAME_MAX_LEN     = 256;       // max name len = 255 plus 1 for null terminator
-    static const uint32_t CHUNK_HEADER_LEN = 12;        // 4 bytes for each of: chunk_id, chunk_size, chunk_child_size 
+    static const uint32_t CHUNK_HEADER_LEN = 12;        // 4 bytes for each of: chunk_id, chunk_size, chunk_child_size
 
     // Some older .vox files will not store a palette, in which case the following palette will be used!
     static const uint8_t k_default_vox_palette[256 * 4] = {
@@ -813,6 +813,84 @@
         size_t count;      // size of the array
     };
 
+    // a growing array where data is suballocated.
+    class _vox_suballoc_array {
+    public:
+        _vox_suballoc_array()  {
+            data.reserve(1024);
+            // push a sentinel character into this array. This allows clients to keep an
+            // offset rather than a pointer and still allow an offset of 0 to mean invalid.
+            data.push_back('X');
+        }
+
+        void reserve(size_t new_capacity) {
+            data.reserve(new_capacity);
+        }
+
+        size_t size() const {
+            return data.size();
+        }
+
+        // gets the offset of a pointer that was allocated within this array.
+        size_t offset_of(void* ptr) const {
+            size_t unaligned_data = (size_t)&data[0];
+            size_t unaligned_ptr  = (size_t)ptr;
+            ogt_assert(unaligned_ptr >= unaligned_data && unaligned_ptr < (unaligned_data + data.size()), "provided ptr is out of bounds in this array");
+            return unaligned_ptr - unaligned_data;
+        }
+
+        // gets a typed pointer given an offset into the block
+        template <class T>
+        const T * get_ptr(size_t offset) const {
+            ogt_assert(0 == offset % sizeof(T), "offset is not properly aligned for this datatype");
+            return (T*)&data[offset];
+        }
+
+        // gets a mutable typed pointer given an offset into the block
+        template <class T>
+        T * get_ptr(size_t offset) {
+            ogt_assert(0 == offset % sizeof(T), "offset is not properly aligned for this datatype");
+            return (T*)&data[offset];
+        }
+
+        // allocates num_bytes of memory with optionally specified base offset alignment.
+        void* alloc(size_t num_bytes, size_t align=0) {
+            if (align > 1 && 0 != (data.size() % align)) {
+                size_t padding = align - (data.size() % align);
+                data.alloc_many(padding);
+            }
+            return data.alloc_many(num_bytes);
+        }
+
+        // allocates and returns a pointer to many elements of the specified type.
+        // if align != 0, will use that alignment, otherwise will align to the size of the type T.
+        template <class T>
+        T* alloc_many(size_t num_elements, size_t align=0) {
+            // if alignment is specified use that, otherwise default alignment to the size fo the type T
+            align = align == 0 ? sizeof(T) : align;
+            return (T*)alloc(sizeof(T) * num_elements, align);
+        }
+
+        // returns the offset in the memory blob that the data was pushed to.
+        template <class T>
+        size_t push_back_many(const T * new_elements, size_t num_elements, size_t align=0) {
+            T * mem = alloc_many<T>(num_elements, align);
+            if (!mem)
+                return 0;
+            memcpy(mem, new_elements, sizeof(T)*num_elements);
+            return offset_of(mem);
+        }
+
+        // returns the offset in the memory blob that the string was pushed to.
+        size_t push_string(const char* str) {
+            size_t str_size = _vox_strlen(str) + 1; // +1 for terminator
+            return push_back_many(str, str_size);
+        }
+
+    private:
+        _vox_array<char> data;
+    };
+
     // progress callback function.
     static ogt_vox_progress_callback_func g_progress_callback_func = NULL;
     static void* g_progress_callback_user_data = NULL;
@@ -1055,7 +1133,7 @@
 
     static void generate_instances_for_node(
         _vox_array<const _vox_scene_node_*> & stack, const _vox_array<_vox_scene_node_> & nodes, uint32_t node_index, const _vox_array<uint32_t> & child_id_array, const _vox_array<ogt_vox_model*> & model_ptrs,
-        _vox_array<ogt_vox_instance> & instances, _vox_array<char> & misc_data, _vox_array<ogt_vox_group>& groups, uint32_t group_index, bool generate_keyframes)
+        _vox_array<ogt_vox_instance> & instances, _vox_suballoc_array & misc_data, _vox_array<ogt_vox_group>& groups, uint32_t group_index, bool generate_keyframes)
     {
         const _vox_scene_node_* node = &nodes[node_index];
         switch (node->node_type)
@@ -1084,9 +1162,7 @@
                     group.name               = 0;
                     const char* transform_last_name = last_transform->u.transform.name;
                     if (transform_last_name && transform_last_name[0]) {
-                        group.name = (const char*)(misc_data.size());
-                        size_t name_size = _vox_strlen(transform_last_name) + 1;       // +1 for terminator
-                        misc_data.push_back_many(transform_last_name, name_size);
+                        group.name = (const char*)misc_data.push_string(transform_last_name);
                     }
                     clear_anim_transform(&group.transform_anim);
                     if (generate_keyframes) {
@@ -1128,9 +1204,7 @@
                     new_instance.name = 0;
                     const char* transform_last_name = last_transform->u.transform.name;
                     if (transform_last_name && transform_last_name[0]) {
-                        new_instance.name = (const char*)(misc_data.size());
-                        size_t name_size = _vox_strlen(transform_last_name) + 1;       // +1 for terminator
-                        misc_data.push_back_many(transform_last_name, name_size);
+                        new_instance.name = (const char*)misc_data.push_string(transform_last_name);
                     }
                     // generate keyframes if necessary.
                     clear_anim_transform(&new_instance.transform_anim);
@@ -1292,7 +1366,7 @@
         _vox_array<_vox_scene_node_> nodes;
         _vox_array<ogt_vox_instance> instances;
         _vox_array<ogt_vox_cam>      cameras;
-        _vox_array<char>             misc_data;
+        _vox_suballoc_array           misc_data;
         _vox_array<ogt_vox_layer>    layers;
         _vox_array<ogt_vox_group>    groups;
         _vox_array<uint32_t>         child_ids;
@@ -1318,7 +1392,6 @@
         // push a sentinel character into these datastructures. This allows us to keep indexes
         // rather than pointers into data-structures that grow, and still allow an index of 0
         // to means invalid
-        misc_data.push_back('X');
         child_ids.push_back(UINT32_MAX);
 
         // copy the default palette into the scene. It may get overwritten by a palette chunk later
@@ -1442,8 +1515,9 @@
                     ogt_assert(num_frames > 0, "must have at least 1 frame in nTRN chunk");
 
                     // make space in misc_data array for the number of transforms we'll need for this node
-                    size_t keyframe_offset = misc_data.size();
-                    ogt_vox_keyframe_transform* keyframes = (ogt_vox_keyframe_transform*)misc_data.alloc_many(num_frames * sizeof(ogt_vox_keyframe_transform));
+                    ogt_vox_keyframe_transform* keyframes = misc_data.alloc_many<ogt_vox_keyframe_transform>(num_frames);
+                    size_t keyframe_offset = misc_data.offset_of(keyframes);
+
                     for (uint32_t i = 0; i < num_frames; i++) {
                         // Parse the frame dictionary that contains:
                         //   _r : int8 ROTATION (c)
@@ -1452,7 +1526,7 @@
                         _vox_file_read_dict(&dict, fp);
                         const char* rotation_value    = _vox_dict_get_value_as_string(&dict, "_r");
                         const char* translation_value = _vox_dict_get_value_as_string(&dict, "_t");
-                        keyframes[ i ].transform      = _vox_make_transform_from_dict_strings(rotation_value, translation_value);
+                        keyframes[i].transform        = _vox_make_transform_from_dict_strings(rotation_value, translation_value);
                         keyframes[i].frame_index      = _vox_dict_get_value_as_uint32(&dict, "_f", 0);
                     }
                     // setup the transform node.
@@ -1516,8 +1590,8 @@
                     _vox_file_read_uint32(fp, &num_models);
                     ogt_assert(num_models > 0, "must have at least 1 frame in nSHP chunk"); // must be 1 according to the spec.
 
-                    uint32_t keyframe_offset = (uint32_t)misc_data.size();
-                    ogt_vox_keyframe_model* keyframes = (ogt_vox_keyframe_model*)misc_data.alloc_many(num_models * sizeof(ogt_vox_keyframe_model));
+                    ogt_vox_keyframe_model* keyframes = misc_data.alloc_many<ogt_vox_keyframe_model>(num_models);
+                    size_t keyframe_offset = misc_data.offset_of(keyframes);
 
                     for (uint32_t i = 0; i < num_models; i++) {
                         // read model id
@@ -1563,9 +1637,7 @@
                     // within string data. This will be patched to a real pointer at the very end.
                     const char* name_string = _vox_dict_get_value_as_string(&dict, "_name", NULL);
                     if (name_string) {
-                        layers[layer_id].name = (const char*)(misc_data.size());
-                        size_t name_size = _vox_strlen(name_string) + 1;       // +1 for terminator
-                        misc_data.push_back_many(name_string, name_size);
+                        layers[layer_id].name = (const char*)misc_data.push_string(name_string);
                     }
                     layers[layer_id].hidden = _vox_dict_get_value_as_bool(&dict, "_hidden", false);
 
@@ -1626,6 +1698,11 @@
                     if (ior_string) {
                         materials.matl[material_id].content_flags |= k_ogt_vox_matl_have_ior;
                         materials.matl[material_id].ior = (float)atof(ior_string);
+                    }
+                    const char* ri_string = _vox_dict_get_value_as_string(&dict, "_ri", NULL);
+                    if (ri_string) {
+                        materials.matl[material_id].content_flags |= k_ogt_vox_matl_have_ior;
+                        materials.matl[material_id].ior = (float)atof(ri_string) - 1.0f;
                     }
                     const char* att_string = _vox_dict_get_value_as_string(&dict, "_att", NULL);
                     if (att_string) {
@@ -1765,7 +1842,7 @@
                     }
                     const char* radius_string = _vox_dict_get_value_as_string(&dict, "_radius", NULL);
                     if (radius_string) {
-                        _vox_str_scanf(angle_string, "%i", &camera.radius);
+                        _vox_str_scanf(radius_string, "%f", &camera.radius);
                     }
                     const char* frustum_string = _vox_dict_get_value_as_string(&dict, "_frustum", NULL);
                     if (frustum_string) {
@@ -1773,7 +1850,7 @@
                     }
                     const char* fov_string = _vox_dict_get_value_as_string(&dict, "_fov", NULL);
                     if (fov_string) {
-                        _vox_str_scanf(angle_string, "%i", &camera.fov);
+                        _vox_str_scanf(fov_string, "%i", &camera.fov);
                     }
 
                     cameras.push_back(camera);
@@ -1789,7 +1866,7 @@
             } // end switch
 
             if (g_progress_callback_func) {
-                // we indicate progress as 0.8f * amount of buffer read + 0.2f at end after processing 
+                // we indicate progress as 0.8f * amount of buffer read + 0.2f at end after processing
                 if (!g_progress_callback_func(0.8f*(float)(fp->offset)/(float)(fp->buffer_size), g_progress_callback_user_data))
                 {
                     return 0;
@@ -1822,7 +1899,7 @@
                             frame_indices.resize(0);
                             // first populate frame_indices with the keyframes on the instance itself
                             uint32_t start_index = 0;
-                            const ogt_vox_keyframe_transform* instance_keyframes = (const ogt_vox_keyframe_transform*)&misc_data[(size_t)instance->transform_anim.keyframes];
+                            const ogt_vox_keyframe_transform* instance_keyframes = misc_data.get_ptr<ogt_vox_keyframe_transform>((size_t)instance->transform_anim.keyframes);
                             for (uint32_t f = 0; f < instance->transform_anim.num_keyframes; f++) {
                                 start_index = frame_indices.insert_unique_sorted(instance_keyframes[f].frame_index, start_index);
                             }
@@ -1830,7 +1907,7 @@
                             uint32_t group_index = instance->group_index;
                             while (group_index != k_invalid_group_index) {
                                 const ogt_vox_group* group = &groups[group_index];
-                                const ogt_vox_keyframe_transform* group_keyframes = (const ogt_vox_keyframe_transform*)&misc_data[(size_t)group->transform_anim.keyframes];
+                                const ogt_vox_keyframe_transform* group_keyframes = misc_data.get_ptr<ogt_vox_keyframe_transform>((size_t)group->transform_anim.keyframes);
                                 start_index = 0;
                                 for (uint32_t f = 0; f < group->transform_anim.num_keyframes; f++) {
                                     start_index = frame_indices.insert_unique_sorted(group_keyframes[f].frame_index, start_index);
@@ -1839,16 +1916,16 @@
                             }
                         }
                         // use the ordered frame indices to sample the flattened transform from the keyframes from the instance and all its parent groups
-                        size_t new_keyframe_offset = misc_data.size();
-                        ogt_vox_keyframe_transform* new_keyframes = (ogt_vox_keyframe_transform*)misc_data.alloc_many(sizeof(ogt_vox_keyframe_transform) * frame_indices.size());
+                        ogt_vox_keyframe_transform* new_keyframes = misc_data.alloc_many<ogt_vox_keyframe_transform>(frame_indices.size());
+                        size_t new_keyframe_offset = misc_data.offset_of(new_keyframes);
                         for (uint32_t f = 0; f < frame_indices.size(); f++) {
                             uint32_t frame_index = frame_indices[f];
-                            const ogt_vox_keyframe_transform* instance_keyframes = (const ogt_vox_keyframe_transform*)&misc_data[(size_t)instance->transform_anim.keyframes];
+                            const ogt_vox_keyframe_transform* instance_keyframes = misc_data.get_ptr<ogt_vox_keyframe_transform>((size_t)instance->transform_anim.keyframes);
                             ogt_vox_transform flattened_transform = sample_keyframe_transform(instance_keyframes, instance->transform_anim.num_keyframes, instance->transform_anim.loop, frame_index);
                             uint32_t group_index = instance->group_index;
                             while (group_index != k_invalid_group_index) {
                                 const ogt_vox_group* group = &groups[group_index];
-                                const ogt_vox_keyframe_transform* group_keyframes = (const ogt_vox_keyframe_transform*)&misc_data[(size_t)group->transform_anim.keyframes];
+                                const ogt_vox_keyframe_transform* group_keyframes = misc_data.get_ptr<ogt_vox_keyframe_transform>((size_t)group->transform_anim.keyframes);
                                 ogt_vox_transform group_transform = sample_keyframe_transform(group_keyframes, group->transform_anim.num_keyframes, group->transform_anim.loop, frame_index);
                                 flattened_transform = ogt_vox_transform_multiply(flattened_transform, group_transform);
                                 group_index = groups[group_index].parent_group_index;
@@ -1915,8 +1992,12 @@
                 instances[i].layer_index = 0;
             // add a single layer
             ogt_vox_layer new_layer;
-            new_layer.hidden = false;
-            new_layer.name   = NULL;
+            new_layer.hidden  = false;
+            new_layer.name    = NULL;
+            new_layer.color.r = 0;
+            new_layer.color.g = 0;
+            new_layer.color.b = 0;
+            new_layer.color.a = 0;
             layers.push_back(new_layer);
         }
 
@@ -1994,7 +2075,7 @@
                         if (instances[k].model_index == j)
                             instances[k].model_index = i;
                         if (instances[k].model_anim.num_keyframes) {
-                            ogt_vox_keyframe_model* keyframes = (ogt_vox_keyframe_model* )&misc_data[(size_t)instances[k].model_anim.keyframes];
+                            ogt_vox_keyframe_model* keyframes = misc_data.get_ptr<ogt_vox_keyframe_model>((size_t)instances[k].model_anim.keyframes);
                             for (uint32_t f = 0; f < instances[k].model_anim.num_keyframes; f++) {
                                 if (keyframes[f].model_index == j)
                                     keyframes[f].model_index = i;
@@ -2053,7 +2134,7 @@
         {
             // copy name data into the scene
             char* scene_misc_data = (char*)&scene[1];
-            memcpy(scene_misc_data, &misc_data[0], sizeof(char) * misc_data.size());
+            memcpy(scene_misc_data, misc_data.get_ptr<char>(0), sizeof(char) * misc_data.size());
 
             // copy instances over to scene
             size_t num_scene_instances = instances.size();
@@ -2373,7 +2454,7 @@
                 }
             }
 
-            if (g_progress_callback_func) { 
+            if (g_progress_callback_func) {
                 // we indicate progress as number of models written, with an extra progress value for ending write
                 if (!g_progress_callback_func((float)(i + 1)/(float)(scene->num_models + 1), g_progress_callback_user_data))
                 {
@@ -2491,7 +2572,7 @@
             const char *cam_mode;
             _vox_sprintf(cam_focus, sizeof(cam_focus), "%.5f %.5f %.5f", camera->focus[0], camera->focus[1], camera->focus[2]);
             _vox_sprintf(cam_angle, sizeof(cam_angle), "%.5f %.5f %.5f", camera->angle[0], camera->angle[1], camera->angle[2]);
-            _vox_sprintf(cam_radius, sizeof(cam_radius), "%i", camera->radius);
+            _vox_sprintf(cam_radius, sizeof(cam_radius), "%.5f", camera->radius);
             _vox_sprintf(cam_frustum, sizeof(cam_frustum), "%.5f", camera->frustum);
             _vox_sprintf(cam_fov, sizeof(cam_fov), "%i", camera->fov);
 
@@ -2685,7 +2766,7 @@
             *main_chunk_child_size = *buffer_size - offset_post_main_chunk;
         }
 
-        if (g_progress_callback_func) { 
+        if (g_progress_callback_func) {
             // we indicate progress as number of models written, with an extra progress value for ending write
             g_progress_callback_func(1.0f,g_progress_callback_user_data); // we ignore the return as exiting here anyway
         }
